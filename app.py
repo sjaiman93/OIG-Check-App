@@ -2,8 +2,8 @@
 Master Federal Compliance Auditor
 ==================================
 Bulk screens a candidate roster against OIG LEIE, SAM.gov Exclusions,
-and OFAC (SDN + Consolidated Non-SDN) lists, and issues a certified
-audit PDF per cleared candidate.
+and the full OFAC SDN + Alternate + Consolidated + Alternate name sets,
+issuing an automated preliminary screening PDF per cleared candidate.
 
 --------------------------------------------------------------------
 DEPLOYMENT — STREAMLIT COMMUNITY CLOUD
@@ -12,6 +12,7 @@ DEPLOYMENT — STREAMLIT COMMUNITY CLOUD
 2. requirements.txt:
        streamlit
        pandas
+       numpy
        reportlab
        rapidfuzz
        pytz
@@ -36,6 +37,7 @@ import uuid
 import zipfile
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import pytz
 import streamlit as st
@@ -50,6 +52,7 @@ from reportlab.platypus import (HRFlowable, Paragraph, SimpleDocTemplate,
 st.set_page_config(page_title="Master Federal Compliance Auditor", layout="wide")
 EASTERN = pytz.timezone("US/Eastern")
 OFAC_THRESHOLD = 85
+OFAC_CDIST_CHUNK_SIZE = 5000  # tune down if you hit memory limits on your host
 
 # =====================================================================
 # Loaders
@@ -89,40 +92,45 @@ def load_sam(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+def _extract_ofac_names_fixed(file_bytes: bytes, name_col_idx: int, source_label: str) -> pd.DataFrame:
+    """Load a headerless OFAC flat file and pull the name field from a
+    hardcoded, known-good column position:
+      - SDN.CSV / CONS_PRIM.CSV -> name is column index 1
+      - ALT.CSV  / CONS_ALT.CSV -> name is column index 3
+    """
+    df = pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=str, low_memory=False)
+
+    if df.shape[1] <= name_col_idx:
+        raise ValueError(
+            f"{source_label}: expected a name column at index {name_col_idx}, "
+            f"but the file only has {df.shape[1]} columns. Confirm this is the "
+            "correct, unmodified Treasury export."
+        )
+
+    names = df[name_col_idx].astype(str).str.strip()
+    out = pd.DataFrame({"ofac_name": names, "ofac_source": source_label})
+    out = out[out["ofac_name"].str.len() > 0]
+    out = out[~out["ofac_name"].str.lower().isin(["nan", "none", "-0-"])]
+    return out.reset_index(drop=True)
+
+
 @st.cache_data(show_spinner=False)
-def load_ofac(sdn_bytes: bytes, consolidated_bytes: bytes) -> pd.DataFrame:
-    """Combine SDN + Consolidated lists into one lookup frame with a
-    single normalized 'ofac_name' column, tagged by source list."""
-    sdn = pd.read_csv(io.BytesIO(sdn_bytes), dtype=str, low_memory=False)
-    con = pd.read_csv(io.BytesIO(consolidated_bytes), dtype=str, low_memory=False)
+def load_ofac(sdn_bytes, alt_bytes, cons_prim_bytes, cons_alt_bytes) -> pd.DataFrame:
+    """Combine all four OFAC files into one normalized lookup frame,
+    each row tagged with which specific source file it came from.
+    Column positions are hardcoded per the known Treasury flat-file layout."""
+    frames = [
+        _extract_ofac_names_fixed(sdn_bytes, name_col_idx=1, source_label="OFAC SDN (Primary)"),
+        _extract_ofac_names_fixed(alt_bytes, name_col_idx=3, source_label="OFAC SDN (Alternate)"),
+        _extract_ofac_names_fixed(cons_prim_bytes, name_col_idx=1, source_label="OFAC Consolidated (Primary)"),
+        _extract_ofac_names_fixed(cons_alt_bytes, name_col_idx=3, source_label="OFAC Consolidated (Alternate)"),
+    ]
+    combined = pd.concat(frames, ignore_index=True)
 
-    sdn.columns = [c.strip().lower() for c in sdn.columns]
-    con.columns = [c.strip().lower() for c in con.columns]
-
-    name_candidates = ["name", "sdn_name", "primary_name", "entity_name", "full_name"]
-
-    def find_name_col(df):
-        col = next((c for c in name_candidates if c in df.columns), None)
-        if col is None:
-            # fall back to the first object/string-like column
-            col = df.columns[0]
-        return col
-
-    sdn_name_col = find_name_col(sdn)
-    con_name_col = find_name_col(con)
-
-    sdn_out = pd.DataFrame({
-        "ofac_name": sdn[sdn_name_col].astype(str).str.strip(),
-        "ofac_source": "OFAC SDN",
-    })
-    con_out = pd.DataFrame({
-        "ofac_name": con[con_name_col].astype(str).str.strip(),
-        "ofac_source": "OFAC Consolidated Non-SDN",
-    })
-
-    combined = pd.concat([sdn_out, con_out], ignore_index=True)
-    combined = combined[combined["ofac_name"].str.len() > 0].reset_index(drop=True)
-    return combined
+    # De-duplicate exact repeated names to shrink the matching array — first
+    # occurrence's source label wins for display purposes.
+    deduped = combined.drop_duplicates(subset="ofac_name").reset_index(drop=True)
+    return deduped
 
 
 def load_roster(uploaded_file) -> pd.DataFrame:
@@ -153,7 +161,7 @@ def split_name(full_name: str):
 
 
 # =====================================================================
-# Matching logic
+# Exact-match logic (OIG, SAM)
 # =====================================================================
 
 def check_oig(name: str, oig_df: pd.DataFrame):
@@ -178,73 +186,129 @@ def check_sam(name: str, sam_df: pd.DataFrame):
     return result.to_dict("records")
 
 
-def check_ofac(name: str, ofac_df: pd.DataFrame, choices: list):
-    """rapidfuzz fuzzy match against combined OFAC name list, threshold 85."""
-    if not name or not choices:
-        return None
-    match = process.extractOne(name.upper(), choices, scorer=fuzz.token_sort_ratio)
-    if match is None:
-        return None
-    matched_text, score, idx = match
-    if score >= OFAC_THRESHOLD:
-        row = ofac_df.iloc[idx]
-        return {
-            "matched_name": row["ofac_name"],
-            "source": row["ofac_source"],
-            "score": round(score, 1),
-        }
-    return None
+# =====================================================================
+# Batch OFAC fuzzy matching via rapidfuzz.process.cdist
+# =====================================================================
+
+def batch_ofac_match(queries: list, choices: list, threshold: int = OFAC_THRESHOLD,
+                      chunk_size: int = OFAC_CDIST_CHUNK_SIZE):
+    """
+    Vectorized fuzzy matching of every query name against the full OFAC
+    choices array using rapidfuzz.process.cdist, chunked over `choices` so
+    the score matrix never has to hold (n_queries x n_choices) all at once
+    in memory (that would be enormous against a full OFAC list at
+    thousands of roster entries).
+
+    Returns two numpy arrays aligned to `queries`:
+      best_score[i]  -> highest token_set_ratio score for queries[i]
+      best_idx[i]    -> index into `choices` of that best match (-1 if none)
+    """
+    n_q = len(queries)
+    if n_q == 0 or not choices:
+        return np.zeros(0), np.full(0, -1)
+
+    best_score = np.zeros(n_q, dtype=float)
+    best_idx = np.full(n_q, -1, dtype=int)
+
+    for start in range(0, len(choices), chunk_size):
+        chunk = choices[start:start + chunk_size]
+        # scores: shape (n_q, len(chunk))
+        scores = process.cdist(queries, chunk, scorer=fuzz.token_set_ratio, workers=-1)
+        chunk_best_idx = scores.argmax(axis=1)
+        chunk_best_score = scores[np.arange(n_q), chunk_best_idx]
+
+        better = chunk_best_score > best_score
+        best_score[better] = chunk_best_score[better]
+        best_idx[better] = chunk_best_idx[better] + start
+
+    below_threshold = best_score < threshold
+    best_idx[below_threshold] = -1
+    return best_score, best_idx
 
 
-def audit_candidate(primary_name: str, aliases: str, oig_df, sam_df, ofac_df, ofac_choices):
-    """Checks primary + every alias against all three sources.
-    Returns a list of exception dicts (empty list = cleared)."""
-    names_to_check = [primary_name] + [a.strip() for a in aliases.split(",") if a.strip()]
-    exceptions = []
+def run_batch_audit(roster_df: pd.DataFrame, oig_df, sam_df, ofac_df):
+    """
+    Two-pass audit:
+      Pass 1 (fast, per-row): OIG + SAM exact matches, since these are
+        cheap dataframe boolean filters even at thousands of rows.
+      Pass 2 (batched): every candidate/alias name across the ENTIRE
+        roster is collected once, deduplicated, and run through a single
+        cdist batch pass against OFAC — not one extractOne call per name.
+    """
+    # ---- Flatten every (row_idx, name) pair across primary + aliases ----
+    flat_names = []  # list of (row_idx, name)
+    for idx, row in roster_df.iterrows():
+        names = [row["Primary Name"]] + [a.strip() for a in row["Aliases"].split(",") if a.strip()]
+        for name in names:
+            if name:
+                flat_names.append((idx, name))
 
-    for name in names_to_check:
-        if not name:
-            continue
+    # ---- Pass 1: OIG + SAM exact matches (per unique name, still cheap) ----
+    exceptions_by_row = {idx: [] for idx in roster_df.index}
+    unique_names = sorted(set(name for _, name in flat_names))
 
-        for rec in check_oig(name, oig_df):
-            exceptions.append({
+    oig_hits_by_name = {}
+    sam_hits_by_name = {}
+    for name in unique_names:
+        oig_hits_by_name[name] = check_oig(name, oig_df)
+        sam_hits_by_name[name] = check_sam(name, sam_df)
+
+    for idx, name in flat_names:
+        for rec in oig_hits_by_name[name]:
+            exceptions_by_row[idx].append({
                 "Matched Name": name,
                 "Source": "OIG LEIE",
                 "Match Score": "Exact",
                 "Detail": f"{rec.get('excltype', 'N/A')} / {rec.get('state', 'N/A')}",
             })
-
-        for rec in check_sam(name, sam_df):
-            exceptions.append({
+        for rec in sam_hits_by_name[name]:
+            exceptions_by_row[idx].append({
                 "Matched Name": name,
                 "Source": "SAM.gov",
                 "Match Score": "Exact",
                 "Detail": "SAM.gov Exclusions Public Extract",
             })
 
-        ofac_hit = check_ofac(name, ofac_df, ofac_choices)
-        if ofac_hit:
-            exceptions.append({
+    # ---- Pass 2: single batched OFAC fuzzy pass over unique names ----
+    ofac_choices = ofac_df["ofac_name"].str.upper().tolist()
+    query_list = [n.upper() for n in unique_names]
+
+    best_score, best_idx = batch_ofac_match(query_list, ofac_choices, threshold=OFAC_THRESHOLD)
+
+    ofac_result_by_name = {}
+    for name, score, idx_in_choices in zip(unique_names, best_score, best_idx):
+        if idx_in_choices >= 0:
+            row = ofac_df.iloc[idx_in_choices]
+            ofac_result_by_name[name] = {
+                "matched_name": row["ofac_name"],
+                "source": row["ofac_source"],
+                "score": round(float(score), 1),
+            }
+
+    for idx, name in flat_names:
+        hit = ofac_result_by_name.get(name)
+        if hit:
+            exceptions_by_row[idx].append({
                 "Matched Name": name,
-                "Source": ofac_hit["source"],
-                "Match Score": f"{ofac_hit['score']}%",
-                "Detail": f"Fuzzy match to '{ofac_hit['matched_name']}'",
+                "Source": hit["source"],
+                "Match Score": f"{hit['score']}%",
+                "Detail": f"Fuzzy match to '{hit['matched_name']}'",
             })
 
-    return exceptions
+    return exceptions_by_row
 
 
 # =====================================================================
-# PDF certificate
+# PDF report
 # =====================================================================
 
-def build_certificate_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
+def build_report_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.9 * inch, bottomMargin=0.9 * inch)
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "TitleStyle", parent=styles["Title"], fontSize=18, spaceAfter=4,
+        "TitleStyle", parent=styles["Title"], fontSize=17, spaceAfter=4,
         textColor=colors.HexColor("#1a3d63"),
     )
     section_style = ParagraphStyle(
@@ -265,7 +329,7 @@ def build_certificate_pdf(candidate_name: str, aliases: str, audit_id: str) -> b
     aliases_display = aliases if aliases else "None provided"
 
     elements = [
-        Paragraph("Certified Master Federal Compliance Audit", title_style),
+        Paragraph("Automated Preliminary Name Screening Report", title_style),
         Paragraph("Internal RPO Compliance System &mdash; Automated Screening Record", subtitle_style),
         HRFlowable(width="100%", color=colors.HexColor("#cccccc"), thickness=1),
         Spacer(1, 10),
@@ -274,7 +338,7 @@ def build_certificate_pdf(candidate_name: str, aliases: str, audit_id: str) -> b
     candidate_table = Table([
         ["Candidate Name:", candidate_name],
         ["Aliases Screened:", aliases_display],
-        ["Audit Timestamp:", now_eastern],
+        ["Timestamp:", now_eastern],
         ["Audit ID:", audit_id],
     ], colWidths=[1.7 * inch, 4.3 * inch])
     candidate_table.setStyle(TableStyle([
@@ -294,34 +358,27 @@ def build_certificate_pdf(candidate_name: str, aliases: str, audit_id: str) -> b
         ]
 
     elements += db_section(
-        "Database 1: OIG LEIE",
+        "OIG LEIE",
         "CLEARED &mdash; No exact first/last name match found.",
         "OIG LEIE Database",
     )
     elements += db_section(
-        "Database 2: SAM.gov Exclusions",
+        "SAM.gov Exclusions",
         "CLEARED &mdash; No exact first/last name match found.",
-        "SAM Exclusions Public Extract V2",
+        "SAM Exclusions Public Extract",
     )
     elements += db_section(
-        "Database 3: OFAC Sanctions (SDN &amp; Consolidated)",
+        "OFAC Sanctions (SDN &amp; Consolidated, Primary &amp; Alternate)",
         f"CLEARED &mdash; No matches at or above {OFAC_THRESHOLD}% fuzzy-match confidence threshold.",
-        "OFAC SDN List &amp; OFAC Consolidated Non-SDN List",
+        "SDN.CSV, ALT.CSV, CONS_PRIM.CSV, CONS_ALT.CSV",
     )
 
     elements.append(Spacer(1, 18))
     elements.append(HRFlowable(width="100%", color=colors.HexColor("#cccccc"), thickness=1))
     elements.append(Spacer(1, 8))
     elements.append(Paragraph(
-        "This certificate is generated automatically by the internal RPO Compliance "
-        "System for internal recordkeeping purposes only. Screening is performed by "
-        "automated name-matching against the source lists identified above at the "
-        "timestamp shown; it does not include Social Security Number, Date of Birth, "
-        "or NPI-level verification and does not constitute a legal determination of "
-        "exclusion or sanctions status. Any candidate flagged as an exception requires "
-        "manual review and independent verification directly on the official federal "
-        "portals (LEIE, SAM.gov, and OFAC) prior to placement, using identifiers beyond "
-        "name alone.",
+        "This is a preliminary name-string match only. Definitive clearance requires "
+        "manual SSN/DOB verification on official federal portals.",
         footer_style,
     ))
 
@@ -335,23 +392,33 @@ def build_certificate_pdf(candidate_name: str, aliases: str, audit_id: str) -> b
 # =====================================================================
 
 st.title("🛡️ Master Federal Compliance Auditor")
-st.caption("Bulk screening against OIG LEIE, SAM.gov Exclusions, and OFAC SDN / Consolidated lists.")
+st.caption("Bulk screening against OIG LEIE, SAM.gov Exclusions, and the full OFAC SDN/Consolidated name sets.")
 
-c1, c2, c3 = st.columns(3)
-with c1:
+st.subheader("Source Files")
+r1c1, r1c2 = st.columns(2)
+with r1c1:
     oig_file = st.file_uploader("1. OIG LEIE Database (CSV)", type=["csv"])
-with c2:
-    sam_file = st.file_uploader("2. SAM.gov Exclusions Extract (CSV)", type=["csv"])
-with c3:
-    roster_file = st.file_uploader("5. Candidate Roster (CSV/Excel)", type=["csv", "xlsx", "xls"])
+with r1c2:
+    sam_file = st.file_uploader("2. SAM.gov Exclusions Public Extract (CSV)", type=["csv"])
 
-c4, c5 = st.columns(2)
-with c4:
-    ofac_sdn_file = st.file_uploader("3. OFAC SDN List (CSV)", type=["csv"])
-with c5:
-    ofac_con_file = st.file_uploader("4. OFAC Consolidated Non-SDN List (CSV)", type=["csv"])
+r2c1, r2c2 = st.columns(2)
+with r2c1:
+    ofac_sdn_file = st.file_uploader("3. OFAC SDN List — Primary (SDN.CSV)", type=["csv"])
+with r2c2:
+    ofac_alt_file = st.file_uploader("4. OFAC SDN List — Alternate (ALT.CSV)", type=["csv"])
 
-all_uploaded = all([oig_file, sam_file, ofac_sdn_file, ofac_con_file, roster_file])
+r3c1, r3c2 = st.columns(2)
+with r3c1:
+    ofac_cons_prim_file = st.file_uploader("5. OFAC Consolidated List — Primary (CONS_PRIM.CSV)", type=["csv"])
+with r3c2:
+    ofac_cons_alt_file = st.file_uploader("6. OFAC Consolidated List — Alternate (CONS_ALT.CSV)", type=["csv"])
+
+roster_file = st.file_uploader("7. Candidate Roster (CSV/Excel)", type=["csv", "xlsx", "xls"])
+
+all_uploaded = all([
+    oig_file, sam_file, ofac_sdn_file, ofac_alt_file,
+    ofac_cons_prim_file, ofac_cons_alt_file, roster_file,
+])
 
 st.divider()
 run_audit = st.button(
@@ -359,14 +426,19 @@ run_audit = st.button(
     disabled=not all_uploaded,
 )
 if not all_uploaded:
-    st.caption("All five files are required before the audit can run.")
+    st.caption("All seven files are required before the audit can run.")
 
 if run_audit:
     with st.spinner("Loading source databases..."):
         try:
             oig_df = load_oig(oig_file.getvalue())
             sam_df = load_sam(sam_file.getvalue())
-            ofac_df = load_ofac(ofac_sdn_file.getvalue(), ofac_con_file.getvalue())
+            ofac_df = load_ofac(
+                ofac_sdn_file.getvalue(),
+                ofac_alt_file.getvalue(),
+                ofac_cons_prim_file.getvalue(),
+                ofac_cons_alt_file.getvalue(),
+            )
         except ValueError as e:
             st.error(str(e))
             st.stop()
@@ -375,39 +447,28 @@ if run_audit:
             st.error("OIG file is missing expected 'firstname'/'lastname' columns after normalization.")
             st.stop()
 
-        ofac_choices = ofac_df["ofac_name"].str.upper().tolist()
-
     try:
         roster_df = load_roster(roster_file)
     except ValueError as e:
         st.error(str(e))
         st.stop()
 
+    with st.spinner(f"Running batched audit across {len(roster_df)} candidates..."):
+        exceptions_by_row = run_batch_audit(roster_df, oig_df, sam_df, ofac_df)
+
     all_exceptions = []
-    cleared_candidates = []  # (primary_name, aliases)
-    total = len(roster_df)
-    progress = st.progress(0, text="Running master audit...")
-
-    for i in range(total):
-        record = roster_df.iloc[i]
-        primary_name = record["Primary Name"]
-        aliases = record["Aliases"]
-
-        exceptions = audit_candidate(primary_name, aliases, oig_df, sam_df, ofac_df, ofac_choices)
-
-        if exceptions:
-            for exc in exceptions:
-                all_exceptions.append({"Candidate": primary_name, **exc})
+    cleared_candidates = []
+    for idx, row in roster_df.iterrows():
+        row_exceptions = exceptions_by_row.get(idx, [])
+        if row_exceptions:
+            for exc in row_exceptions:
+                all_exceptions.append({"Candidate": row["Primary Name"], **exc})
         else:
-            cleared_candidates.append((primary_name, aliases))
-
-        progress.progress((i + 1) / total, text=f"Running master audit... ({i + 1}/{total})")
-
-    progress.empty()
+            cleared_candidates.append((row["Primary Name"], row["Aliases"]))
 
     st.session_state["exceptions_df"] = pd.DataFrame(all_exceptions)
     st.session_state["cleared_candidates"] = cleared_candidates
-    st.session_state["total_processed"] = total
+    st.session_state["total_processed"] = len(roster_df)
     st.session_state["audit_run_at"] = datetime.now(EASTERN).strftime("%Y%m%d_%H%M%S")
     st.session_state.pop("zip_bytes", None)
 
@@ -442,14 +503,14 @@ if "total_processed" in st.session_state:
             "can be false positives."
         )
 
-    st.subheader("📄 Certified Master Audit Certificates (Cleared Candidates)")
+    st.subheader("📄 Preliminary Screening Reports (Cleared Candidates)")
     if cleared_candidates:
-        if st.button("🏗️ Generate & Package Certificates"):
+        if st.button("🏗️ Generate & Package Reports"):
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for name, aliases in cleared_candidates:
                     audit_id = str(uuid.uuid4())
-                    pdf_bytes = build_certificate_pdf(name, aliases, audit_id)
+                    pdf_bytes = build_report_pdf(name, aliases, audit_id)
                     safe_name = "".join(c if c.isalnum() else "_" for c in name)
                     zf.writestr(f"{safe_name}_{audit_id}.pdf", pdf_bytes)
             zip_buffer.seek(0)
@@ -457,12 +518,12 @@ if "total_processed" in st.session_state:
 
         if "zip_bytes" in st.session_state:
             st.download_button(
-                label="⬇️ Download Master Audit Certificates (.zip)",
+                label="⬇️ Download Master Audit Reports (.zip)",
                 data=st.session_state["zip_bytes"],
-                file_name=f"Master_Federal_Compliance_Audit_{st.session_state['audit_run_at']}.zip",
+                file_name=f"Preliminary_Screening_Reports_{st.session_state['audit_run_at']}.zip",
                 mime="application/zip",
                 type="primary",
                 use_container_width=True,
             )
     else:
-        st.info("No cleared candidates to generate certificates for.")
+        st.info("No cleared candidates to generate reports for.")
