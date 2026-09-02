@@ -53,6 +53,7 @@ st.set_page_config(page_title="Master Federal Compliance Auditor", layout="wide"
 EASTERN = pytz.timezone("US/Eastern")
 OFAC_THRESHOLD = 85
 OFAC_CDIST_CHUNK_SIZE = 5000  # tune down if you hit memory limits on your host
+OFAC_FORMAL_LABEL = "U.S. Treasury Specially Designated Nationals and Consolidated Sanctions Lists"
 
 # =====================================================================
 # Loaders
@@ -196,8 +197,7 @@ def batch_ofac_match(queries: list, choices: list, threshold: int = OFAC_THRESHO
     Vectorized fuzzy matching of every query name against the full OFAC
     choices array using rapidfuzz.process.cdist, chunked over `choices` so
     the score matrix never has to hold (n_queries x n_choices) all at once
-    in memory (that would be enormous against a full OFAC list at
-    thousands of roster entries).
+    in memory.
 
     Returns two numpy arrays aligned to `queries`:
       best_score[i]  -> highest token_set_ratio score for queries[i]
@@ -212,7 +212,6 @@ def batch_ofac_match(queries: list, choices: list, threshold: int = OFAC_THRESHO
 
     for start in range(0, len(choices), chunk_size):
         chunk = choices[start:start + chunk_size]
-        # scores: shape (n_q, len(chunk))
         scores = process.cdist(queries, chunk, scorer=fuzz.token_set_ratio, workers=-1)
         chunk_best_idx = scores.argmax(axis=1)
         chunk_best_score = scores[np.arange(n_q), chunk_best_idx]
@@ -229,21 +228,18 @@ def batch_ofac_match(queries: list, choices: list, threshold: int = OFAC_THRESHO
 def run_batch_audit(roster_df: pd.DataFrame, oig_df, sam_df, ofac_df):
     """
     Two-pass audit:
-      Pass 1 (fast, per-row): OIG + SAM exact matches, since these are
-        cheap dataframe boolean filters even at thousands of rows.
+      Pass 1 (fast, per-row): OIG + SAM exact matches.
       Pass 2 (batched): every candidate/alias name across the ENTIRE
-        roster is collected once, deduplicated, and run through a single
-        cdist batch pass against OFAC — not one extractOne call per name.
+        roster is deduplicated and run through a single cdist batch pass
+        against OFAC.
     """
-    # ---- Flatten every (row_idx, name) pair across primary + aliases ----
-    flat_names = []  # list of (row_idx, name)
+    flat_names = []
     for idx, row in roster_df.iterrows():
         names = [row["Primary Name"]] + [a.strip() for a in row["Aliases"].split(",") if a.strip()]
         for name in names:
             if name:
                 flat_names.append((idx, name))
 
-    # ---- Pass 1: OIG + SAM exact matches (per unique name, still cheap) ----
     exceptions_by_row = {idx: [] for idx in roster_df.index}
     unique_names = sorted(set(name for _, name in flat_names))
 
@@ -269,7 +265,6 @@ def run_batch_audit(roster_df: pd.DataFrame, oig_df, sam_df, ofac_df):
                 "Detail": "SAM.gov Exclusions Public Extract",
             })
 
-    # ---- Pass 2: single batched OFAC fuzzy pass over unique names ----
     ofac_choices = ofac_df["ofac_name"].str.upper().tolist()
     query_list = [n.upper() for n in unique_names]
 
@@ -302,7 +297,8 @@ def run_batch_audit(roster_df: pd.DataFrame, oig_df, sam_df, ofac_df):
 # PDF report
 # =====================================================================
 
-def build_report_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
+def build_report_pdf(candidate_name: str, aliases: str, audit_id: str,
+                      oig_file_date: str, sam_file_date: str, ofac_file_date: str) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.9 * inch, bottomMargin=0.9 * inch)
     styles = getSampleStyleSheet()
@@ -320,6 +316,10 @@ def build_report_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
         textColor=colors.HexColor("#555555"), spaceAfter=10,
     )
     body_style = ParagraphStyle("BodyStyle", parent=styles["Normal"], fontSize=9.5, leading=13)
+    vintage_style = ParagraphStyle(
+        "VintageStyle", parent=styles["Normal"], fontSize=9, leading=12,
+        textColor=colors.HexColor("#8a5a00"), spaceAfter=4,
+    )
     footer_style = ParagraphStyle(
         "FooterStyle", parent=styles["Normal"], fontSize=8, leading=11,
         textColor=colors.HexColor("#666666"),
@@ -350,27 +350,36 @@ def build_report_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
     elements.append(candidate_table)
     elements.append(Spacer(1, 6))
 
-    def db_section(title, status_line, source_line):
-        return [
+    def db_section(title, status_line, source_line, vintage_label, vintage_value):
+        block = [
             Paragraph(title, section_style),
             Paragraph(f"<b>Status:</b> {status_line}", body_style),
             Paragraph(f"<b>Source:</b> {source_line}", body_style),
         ]
+        vintage_display = vintage_value.strip() if vintage_value and vintage_value.strip() else "Not specified"
+        block.append(Paragraph(f"<b>{vintage_label}:</b> {vintage_display}", vintage_style))
+        return block
 
     elements += db_section(
         "OIG LEIE",
         "CLEARED &mdash; No exact first/last name match found.",
         "OIG LEIE Database",
+        "Data As Of",
+        oig_file_date,
     )
     elements += db_section(
         "SAM.gov Exclusions",
         "CLEARED &mdash; No exact first/last name match found.",
         "SAM Exclusions Public Extract",
+        "Data As Of",
+        sam_file_date,
     )
     elements += db_section(
         "OFAC Sanctions (SDN &amp; Consolidated, Primary &amp; Alternate)",
         f"CLEARED &mdash; No matches at or above {OFAC_THRESHOLD}% fuzzy-match confidence threshold.",
-        "SDN.CSV, ALT.CSV, CONS_PRIM.CSV, CONS_ALT.CSV",
+        OFAC_FORMAL_LABEL,
+        "Data As Of",
+        ofac_file_date,
     )
 
     elements.append(Spacer(1, 18))
@@ -378,7 +387,10 @@ def build_report_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
     elements.append(Spacer(1, 8))
     elements.append(Paragraph(
         "This is a preliminary name-string match only. Definitive clearance requires "
-        "manual SSN/DOB verification on official federal portals.",
+        "manual SSN/DOB verification on official federal portals. Data vintage for each "
+        "source database is stated above as entered by the reviewing analyst at the time "
+        "of upload; it reflects the file's stated currency, not an independent verification "
+        "of that date by this system.",
         footer_style,
     ))
 
@@ -393,6 +405,13 @@ def build_report_pdf(candidate_name: str, aliases: str, audit_id: str) -> bytes:
 
 st.title("🛡️ Master Federal Compliance Auditor")
 st.caption("Bulk screening against OIG LEIE, SAM.gov Exclusions, and the full OFAC SDN/Consolidated name sets.")
+
+with st.sidebar:
+    st.header("📅 Data Vintage")
+    st.caption("Enter the 'as of' date shown on each source file. This prints on every generated certificate.")
+    oig_file_date = st.text_input("OIG LEIE File Date", placeholder="e.g., 2026-08-15")
+    sam_file_date = st.text_input("SAM.gov File Date", placeholder="e.g., 2026-08-15")
+    ofac_file_date = st.text_input("OFAC File Date", placeholder="e.g., 2026-08-15")
 
 st.subheader("Source Files")
 r1c1, r1c2 = st.columns(2)
@@ -419,6 +438,7 @@ all_uploaded = all([
     oig_file, sam_file, ofac_sdn_file, ofac_alt_file,
     ofac_cons_prim_file, ofac_cons_alt_file, roster_file,
 ])
+all_dates_entered = all([oig_file_date.strip(), sam_file_date.strip(), ofac_file_date.strip()])
 
 st.divider()
 run_audit = st.button(
@@ -427,6 +447,12 @@ run_audit = st.button(
 )
 if not all_uploaded:
     st.caption("All seven files are required before the audit can run.")
+elif not all_dates_entered:
+    st.warning(
+        "One or more data-vintage dates in the sidebar are blank. The audit will still "
+        "run, but generated certificates will show 'Not specified' for any missing date — "
+        "fill these in for a complete compliance record."
+    )
 
 if run_audit:
     with st.spinner("Loading source databases..."):
@@ -470,6 +496,11 @@ if run_audit:
     st.session_state["cleared_candidates"] = cleared_candidates
     st.session_state["total_processed"] = len(roster_df)
     st.session_state["audit_run_at"] = datetime.now(EASTERN).strftime("%Y%m%d_%H%M%S")
+    # Freeze the vintage dates used for this run so the zip stays consistent
+    # even if someone edits the sidebar fields before generating certificates.
+    st.session_state["oig_file_date"] = oig_file_date
+    st.session_state["sam_file_date"] = sam_file_date
+    st.session_state["ofac_file_date"] = ofac_file_date
     st.session_state.pop("zip_bytes", None)
 
 # =====================================================================
@@ -510,7 +541,12 @@ if "total_processed" in st.session_state:
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for name, aliases in cleared_candidates:
                     audit_id = str(uuid.uuid4())
-                    pdf_bytes = build_report_pdf(name, aliases, audit_id)
+                    pdf_bytes = build_report_pdf(
+                        name, aliases, audit_id,
+                        oig_file_date=st.session_state.get("oig_file_date", ""),
+                        sam_file_date=st.session_state.get("sam_file_date", ""),
+                        ofac_file_date=st.session_state.get("ofac_file_date", ""),
+                    )
                     safe_name = "".join(c if c.isalnum() else "_" for c in name)
                     zf.writestr(f"{safe_name}_{audit_id}.pdf", pdf_bytes)
             zip_buffer.seek(0)
